@@ -8,24 +8,31 @@
  * Encapsulates the sub-K pipeline: double-buffered L0A/L0B allocation,
  * L1->L0 DMA copies with SetFlag/WaitFlag synchronization, and mad calls.
  *
- * ## Event ID contract
+ * ## Mutex slot contract
  *
- * This template uses **M_MTE1 event IDs 0 and 1** internally for L0
- * double-buffer synchronization (sk & 1).  The caller MUST:
+ * This template performs its L0 double-buffer synchronization (sk & 1) on
+ * mutex slots buf_offset + (sk & 1), i.e. the pair {buf_offset,
+ * buf_offset + 1} on both PIPE_MTE1 and PIPE_M.  With the default
+ * buf_offset = 0 this is the pair {0, 1}.  The caller MUST:
  *
- *   1. Pre-set these flags exactly once before the first call:
- *        asc_unlock(PIPE_MTE1, 0, ASC_LOCK_BLOCK);
- *        asc_unlock(PIPE_MTE1, 1, ASC_LOCK_BLOCK);
- *   2. Drain them exactly once after the last call:
- *        asc_lock(PIPE_M, 0, ASC_LOCK_BLOCK);
- *        asc_lock(PIPE_M, 1, ASC_LOCK_BLOCK);
+ *   1. Pre-set both slots of the window exactly once before the first
+ *      call, because the template's first asc_lock blocks otherwise:
+ *        asc_unlock(PIPE_MTE1, buf_offset + 0, ASC_LOCK_BLOCK);
+ *        asc_unlock(PIPE_MTE1, buf_offset + 1, ASC_LOCK_BLOCK);
+ *   2. Drain both slots exactly once after the last call:
+ *        asc_lock(PIPE_M, buf_offset + 0, ASC_LOCK_BLOCK);
+ *        asc_lock(PIPE_M, buf_offset + 1, ASC_LOCK_BLOCK);
  *
- *   3. NOT use IDs 0/1 for any other M_MTE1 flags in the surrounding
- *      code.  If the caller also needs M_MTE1 flags for its own L1
- *      double-buffer (e.g. an explicit sub-K loop), use IDs >= 2.
+ *   3. NOT use any slot in [buf_offset, buf_offset + 1] for other
+ *      PIPE_MTE1/PIPE_M synchronization in the surrounding code.  If the
+ *      caller also needs mutex slots for its own L1 double-buffer (e.g.
+ *      an explicit sub-K loop), use ids outside that window.
  *
- * The flags are self-sustaining across consecutive calls — no per-call
- * re-initialization is needed.
+ * The slots are self-sustaining across consecutive calls — no per-call
+ * re-initialization is needed.  A kernel running several of these
+ * templates must pass disjoint buf_offset windows; the flag allocator
+ * (RewriteFlagToBuf) likewise keeps spilled events out of
+ * [buf_offset, buf_offset + 1] for each template instance.
  *
  * \tparam M           Tile M dimension
  * \tparam K           Full K dimension of the L1 tile
@@ -120,6 +127,11 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
  *   - kSFPack    = 2:   two SF values packed in each int16_t
  *   - kSFAddrDiv = 16:  hardware divisor for L0A/L0B SF destination address
  *   - kAddrUnit  = 32:  L1 address unit for NZ stride parameters (bytes)
+ *
+ * Mutex slot contract: identical to ascend_gemm_l1 — the template locks
+ * buf_offset + (sk & 1) on PIPE_MTE1 and PIPE_M, so callers must pre-set,
+ * drain, and reserve the window [buf_offset, buf_offset + 1] as documented
+ * there.
  *
  * \tparam M           Tile M dimension
  * \tparam K           Full K dimension of the L1 tile

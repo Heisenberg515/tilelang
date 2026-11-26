@@ -10,7 +10,7 @@ import tilelang.testing
 from tilelang import tvm
 from tilelang.ascend import transform as ascend_transform
 from tvm import tirx
-from testing.ascend._ir import calls, schedule, statements
+from testing.ascend._ir import calls, kernel, schedule, seq, statements
 
 
 def _make_cross_iter_reuse_program():
@@ -281,6 +281,47 @@ def _make_serial_protocols(count):
     return main
 
 
+def _make_gemm_l1_mutex_window_program(buf_offset: int):
+    """An L1 GEMM (mutex window [buf_offset, buf_offset + 1]) next to a
+    hard_event with nine constant ids, one past the eight flag slots."""
+    a = tirx.decl_buffer((128, 128), "bfloat16", name="a", scope="shared.l1")
+    b = tirx.decl_buffer((128, 128), "bfloat16", name="b", scope="shared.l1")
+    cc = tirx.decl_buffer((128, 128), "float32", name="cc", scope="shared.l0c")
+
+    def ptr(buf, rw):
+        return tirx.call_intrin(
+            "handle",
+            tvm.ir.Op.get("tl.access_ptr"),
+            tirx.BufferLoad(buf, [tirx.IntImm("int32", 0)] * len(buf.shape)),
+            tirx.IntImm("int32", 1),
+            tirx.IntImm("int32", rw),
+        )
+
+    gemm = tirx.Evaluate(
+        tirx.call_intrin(
+            "void",
+            tvm.ir.Op.get("tl.ascend_gemm_l1"),
+            ptr(cc, 2),
+            ptr(a, 1),
+            ptr(b, 1),
+            tirx.IntImm("int32", 128),
+            tirx.IntImm("int32", 128),
+            tirx.IntImm("int32", 128),
+            tirx.IntImm("int32", 64),
+            tirx.IntImm("int32", 1),
+            tirx.IntImm("int32", 1),
+            tirx.StringImm("bfloat16_t"),
+            tirx.IntImm("int32", buf_offset),
+            tirx.IntImm("int32", 0),
+        )
+    )
+    flags = []
+    for event_id in range(9):
+        flags.append(tirx.Evaluate(tirx.call_intrin("void", tvm.ir.Op.get("tl.ascend_set_flag"), tirx.StringImm("V_MTE3"), tirx.IntImm("int32", event_id))))
+        flags.append(tirx.Evaluate(tirx.call_intrin("void", tvm.ir.Op.get("tl.ascend_wait_flag"), tirx.StringImm("V_MTE3"), tirx.IntImm("int32", event_id))))
+    return kernel(seq(*flags, gemm), buffers=[a, b, cc])
+
+
 def _insert_sync(program, *, infer_layouts=False):
     before = schedule(program, through="ResolveCore", auto_schedule=False, infer_layouts=infer_layouts)
     return ascend_transform.InsertSync()(before)
@@ -409,6 +450,20 @@ def test_extent_one_child_uses_only_its_owner_versions(eligible):
     # lose that ring nor create another outer ring for an unclaimed buffer.
     for operation in ("set", "wait"):
         assert len(_constant_ids(mod, operation, "MTE3_MTE2")) == 3
+
+
+@pytest.mark.parametrize("buf_offset", [0, 2], ids=["window-01", "window-23"])
+def test_flag_spill_reserves_gemm_l1_mutex_window(buf_offset):
+    rewritten = ascend_transform.RewriteFlagToBuf()(_make_gemm_l1_mutex_window_program(buf_offset))
+    # The gemm_l1 template owns the mutex slots [buf_offset, buf_offset + 1],
+    # so the one spilled V_MTE3 id must land past that window (buf_offset + 2)
+    # instead of clobbering the template's L0 double-buffer handshake.
+    spilled_ids = {int(call.args[1]) for call in calls(rewritten, "tl.ascend_get_buf")}
+    assert spilled_ids == {buf_offset + 2}
+    assert calls(rewritten, "tl.ascend_rls_buf")
+    # The eight kept ids stay dense in the physical flag namespace.
+    for operation in ("set", "wait"):
+        assert _constant_ids(rewritten, operation, "V_MTE3") == set(range(8))
 
 
 if __name__ == "__main__":

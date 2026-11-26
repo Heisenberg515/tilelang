@@ -431,8 +431,11 @@ TVM_DLL const Op &ascend_mad_mx();
  * \brief Ascend GEMM with L1-scoped inputs (auto sub-K pipeline).
  *
  * ascend_gemm_l1(cc_ptr, cbuf_a_ptr, cbuf_b_ptr, M, K, N, tile_k_sub,
- * trans_b, clear_accum, dtype_str)
+ * trans_b, clear_accum, dtype_str, buf_offset, unit_flag_ctrl)
  *
+ * buf_offset shifts the template's internal mutex slots to
+ * [buf_offset, buf_offset + 1]; see the mutex slot contract documented in
+ * src/tl_templates/ascend/gemm.h.
  */
 TVM_DLL const Op &ascend_gemm_l1();
 
@@ -444,6 +447,10 @@ TVM_DLL const Op &ascend_gemm_l1();
  * accum_dtype_str, buf_offset, sf_k_offset, sf_nz_stride, unit_flag_ctrl)
  *
  * Uses blockscaled_gemm.h template with mad_mx instruction.
+ *
+ * buf_offset shifts the template's internal mutex slots to
+ * [buf_offset, buf_offset + 1]; see the mutex slot contract documented in
+ * src/tl_templates/ascend/gemm.h.
  */
 TVM_DLL const Op &ascend_blockscaled_gemm_l1();
 
