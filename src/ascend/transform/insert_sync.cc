@@ -1505,19 +1505,27 @@ private:
             std::swap(producer, consumer);
         }
         // A stage-s task executes logical iteration (physical_iteration - s).
-        // Therefore two owners ordered in one physical iteration have logical
-        // distances stage(first)-stage(second) and its wraparound complement.
+        // Two owners ordered in one physical iteration therefore have logical
+        // distances stage(first)-stage(second) (first@k and second@k+d share
+        // a physical iteration) and 1-d (second@k precedes first@k+1-d in the
+        // next physical iteration) — the same minimum distances AddSamePipeEdges
+        // derives for the two sites. Clamp negative members like that pass and
+        // RecordLifetimeOrder do: src@k before dst@k+d implies src@k before
+        // dst@k, the closure and IterationOrder model only forward distances,
+        // and materialization pairs flags by site rather than by distance.
         int forward_distance = first->GetStage() - second->GetStage();
         std::vector<DependencyTaskPair> second_to_first;
         second_to_first.reserve(first_to_second.size());
         for (const auto &[producer, consumer] : first_to_second)
           second_to_first.emplace_back(consumer, producer);
         directed_deps.push_back({first, second, dep.storage,
-                                 std::move(first_to_second), forward_distance,
+                                 std::move(first_to_second),
+                                 std::max(forward_distance, 0),
                                  DependencyKind::kOwnerExclusion});
         directed_deps.push_back(
             {second, first, dep.storage, std::move(second_to_first),
-             1 - forward_distance, DependencyKind::kOwnerExclusion});
+             std::max(1 - forward_distance, 0),
+             DependencyKind::kOwnerExclusion});
       }
       deps = std::move(directed_deps);
     }
@@ -1817,13 +1825,12 @@ private:
     for (SyncPoint &sync_point : sync_points) {
       if (closure.Contains(sync_point.edge))
         continue;
-      if (sync_point.dependency_kind == DependencyKind::kOwnerExclusion &&
-          sync_point.edge.distance != 0 && sync_point.edge.distance != 1) {
-        LOG(FATAL) << "InsertSync cannot materialize an uncovered multi-buffer "
-                      "owner exclusion at logical distance "
-                   << sync_point.edge.distance << " (paired distance "
-                   << 1 - sync_point.edge.distance << ")";
-      }
+      // Uncovered multi-buffer owner exclusions materialize the same lexical
+      // handshake for any stage distance: InsertSyncPoints emits the flag
+      // pair from the owner sites alone and never reads edge.distance, and
+      // CollectSyncPoints clamps the {d, 1-d} pair to the closure's forward
+      // distances (see AddSamePipeEdges). Distances outside {0, 1} simply
+      // arise from owner stages more than one slot apart.
       SaturateDependencyEdge(closure, sync_point.edge.AsRange(), max_distance,
                              projection_scope);
       emit.push_back(std::move(sync_point));

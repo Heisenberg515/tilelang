@@ -76,12 +76,9 @@ def test_missing_counter_channel_keeps_lexical_handshake(nested, second_stage, v
     before = kernel(
         seq(unit(tirx.BufferStore(epoch, 0, [0])), body), buffers=[ub, epoch], annotations={"tl.buffer_versions_map": {ub.data: versions}}
     )
-    if second_stage:
-        with pytest.raises(tvm.error.InternalError, match="owner exclusion at logical distance") as error:
-            transform.InsertSync()(before)
-        message = str(error.value)
-        assert f"logical distance {-second_stage} (paired distance {1 + second_stage})" in message
-        return
+    # Owner stages more than one slot apart used to abort InsertSync with
+    # "cannot materialize an uncovered multi-buffer owner exclusion at logical
+    # distance" (#4269). The lexical handshake covers any stage distance.
     after = transform.InsertSync()(before)
     forward_ids = []
     for operation in ("set", "wait"):
