@@ -19,7 +19,7 @@ namespace rocm {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
   static bool AllReduceNeedsWorkspace(int reducing_threads, int,
-                                      Target target) {
+                                      const DataType &, Target target) {
     // tl::AllReduce exchanges through shared memory only when the step crosses
     // a wavefront (offset = threads / 2 >= wave size). Within a wavefront it
     // uses shfl_xor and never touches the workspace, but a workspace in the IR

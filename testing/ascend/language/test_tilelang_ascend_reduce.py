@@ -5,7 +5,10 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 import tilelang.testing
+from tilelang import tvm
 from tilelang.backend.target import determine_target
+from tvm import tirx
+from tvm.tirx.stmt_functor import post_order_visit
 
 DTYPE_MAP = {"float32": torch.float32, "int32": torch.int32, "int64": torch.int64}
 
@@ -291,6 +294,62 @@ def test_pto_reducer_v2_rejects_bfloat16_allreduce():
 
     with determine_target("pto", return_object=True), pytest.raises(Exception, match="PTO cross-thread allreduce.*got bfloat16"):
         tilelang.lower(kernel, target="pto")
+
+
+def _allreduce_calls(artifact):
+    """Collect tl::AscendAllReduce call_extern nodes from lowered device IR.
+
+    The argument count selects the AscendAllReduce::run overload: two
+    arguments mean run(value) with no scratch buffer, three arguments also
+    pass the __ubuf__ scratch pointer for the ub_reduce fallback.
+    """
+    found = []
+
+    def visit(node):
+        if isinstance(node, tirx.Call) and node.args:
+            first = node.args[0]
+            if isinstance(first, tirx.StringImm) and "tl::AscendAllReduce" in first.value:
+                found.append(node)
+
+    for func in artifact.device_mod.functions.values():
+        post_order_visit(func.body, visit)
+    return found
+
+
+@pytest.mark.parametrize(
+    "extent,scale,dtype,expected_arity",
+    [
+        # fp16/bf16 have no ShflXor/HwReduce specialization, so even a
+        # power-of-two warp-internal width falls through to ub_reduce and
+        # must receive a scratch buffer (issue #4293: these used to call
+        # run() with the nullptr default and write through it).
+        (32, 1, "float16", 3),
+        (32, 1, "bfloat16", 3),
+        # Non-power-of-two and cross-warp widths always used the scratch
+        # buffer; the fix must not regress them.
+        (6, 5, "float16", 3),
+        (64, 1, "float16", 3),
+        (64, 1, "float32", 3),
+        # Dtypes with a register-path specialization keep the scratch-free
+        # two-argument form for power-of-two warp-internal widths.
+        (32, 1, "float32", 2),
+        (8, 4, "float32", 2),
+        (32, 1, "int64", 2),
+    ],
+)
+def test_ascend_allreduce_scratch_arity(extent, scale, dtype, expected_arity):
+    # Host-only lowering: the workspace decision happens in the Ascend reduce
+    # lowerer, so the call arity can be asserted without an NPU.
+    with determine_target("ascend", return_object=True), tvm.transform.PassContext(
+        config={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False}
+    ):
+        artifact = tilelang.lower(
+            make_reduce_kernel(extent, scale, dtype, "sum"), target="ascend"
+        )
+
+    calls = _allreduce_calls(artifact)
+    assert len(calls) == 1, f"expected one AscendAllReduce call, got {len(calls)}"
+    assert len(calls[0].args) == expected_arity
 
 
 if __name__ == "__main__":

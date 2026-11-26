@@ -19,7 +19,8 @@ using namespace tirx;
 namespace cuda {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
-  static bool AllReduceNeedsWorkspace(int reducing_threads, int, Target) {
+  static bool AllReduceNeedsWorkspace(int reducing_threads, int,
+                                      const DataType &, Target) {
     return reducing_threads > 32;
   }
 

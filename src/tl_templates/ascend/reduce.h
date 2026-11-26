@@ -338,9 +338,30 @@ private:
     return ub_reduce(x, red_buf);
   }
 
+  // warp_or_ub_noscratch: same SFINAE dispatch as warp_or_ub, but the
+  // fallback is a hard error instead of a UB write, since there is no
+  // scratch buffer for ub_reduce to write through.
+  template <typename U>
+  static __simt_callee__ auto warp_or_ub_noscratch(U x, int)
+      -> decltype(warp_reduce(x, 0)) {
+    return warp_reduce(x, 0);
+  }
+  template <typename U>
+  static __simt_callee__ U warp_or_ub_noscratch(U x, long) {
+    static_assert(!sizeof(U),
+                  "AscendAllReduce::run without a scratch buffer requires a "
+                  "register-reducible dtype (fp32/int32/uint32/int64/uint64) "
+                  "and a power-of-two warp-internal width; pass an __ubuf__ T* "
+                  "scratch buffer otherwise");
+    return x;
+  }
+
 public:
+  // Full dispatch. red_buf is written by the ub_reduce fallback whenever the
+  // reduction cannot stay in registers, so it must point to a valid scratch
+  // buffer (see AllReduceWarpPathScratchFree for the host-side predicate).
   template <typename T>
-  static __simt_callee__ T run(T x, __ubuf__ T *red_buf = nullptr) {
+  static __simt_callee__ T run(T x, __ubuf__ T *red_buf) {
     if constexpr (threads <= scale) {
       return x;
     } else if constexpr (threads <= 32 && is_pow2(threads) && is_pow2(scale)) {
@@ -352,6 +373,22 @@ public:
       return cross_warp_or_ub(x, red_buf, 0);
     } else {
       return ub_reduce(x, red_buf);
+    }
+  }
+
+  // Scratch-free dispatch, valid only when the reduction provably stays in
+  // registers: an identity step (threads <= scale) or a power-of-two
+  // warp-internal step over a dtype with a register-path specialization.
+  template <typename T>
+  static __simt_callee__ T run(T x) {
+    if constexpr (threads <= scale) {
+      return x;
+    } else if constexpr (threads <= 32 && is_pow2(threads) && is_pow2(scale)) {
+      return warp_or_ub_noscratch(x, 0);
+    } else {
+      static_assert(!sizeof(T),
+                    "AscendAllReduce::run needs an __ubuf__ scratch buffer "
+                    "unless the reduction stays in registers");
     }
   }
 };

@@ -18,11 +18,21 @@ using namespace tirx;
 namespace ascend {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
-  static bool AllReduceNeedsWorkspace(int reducing_threads, int, Target) {
+  static bool AllReduceNeedsWorkspace(int reducing_threads, int scale,
+                                      const DataType &dtype, Target) {
     // CheckAllReduceWidth ensures scale divides reducing_threads, so a
     // power-of-two width also has a power-of-two scale.
-    return reducing_threads > 32 ||
-           (reducing_threads & (reducing_threads - 1)) != 0;
+    //
+    // AscendAllReduce::run never touches its scratch buffer when
+    // threads <= scale (the reduction is an identity). Otherwise the
+    // warp-internal register path (threads <= 32, power of two) is only
+    // available for dtypes with a ShflXor/HwReduce specialization; every
+    // other dtype falls through to ub_reduce, which writes through the
+    // scratch buffer, so it must be allocated.
+    return reducing_threads > scale &&
+           (reducing_threads > 32 ||
+            (reducing_threads & (reducing_threads - 1)) != 0 ||
+            !AllReduceWarpPathScratchFree(dtype));
   }
 
   // AscendAllReduce does have XOR-butterfly (asc_shfl_xor) and hardware-reduce

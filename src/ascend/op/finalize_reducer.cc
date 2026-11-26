@@ -100,9 +100,13 @@ Stmt LowerFinalizeReducer(const FinalizeReducerOpNode &op,
 
     Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                           BufferLoad(buffer, indices_0)};
-    // With a validated scale, only power-of-two widths <= 32 need no workspace.
-    if (reducing_threads > 32 ||
-        (reducing_threads & (reducing_threads - 1)) != 0) {
+    // With a validated scale, only power-of-two widths <= 32 whose dtype has
+    // a register-path specialization (see AllReduceWarpPathScratchFree) can
+    // run without a workspace; ub_reduce writes through the scratch buffer.
+    if (reducing_threads > scale &&
+        (reducing_threads > 32 ||
+         (reducing_threads & (reducing_threads - 1)) != 0 ||
+         !AllReduceWarpPathScratchFree(buffer->dtype))) {
       PrimExpr workspace = lower_args.add_workspace(
           *as_const_int(lower_args.thread_bounds->extent), buffer->dtype);
       thread_reduce_args.push_back(workspace);

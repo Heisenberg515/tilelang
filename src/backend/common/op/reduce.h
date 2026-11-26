@@ -1049,7 +1049,8 @@ template <typename Impl> struct ReduceLowerer {
                                   : clear_buffer->dtype;
           PrimExpr workspace;
           bool need_workspace = Impl::AllReduceNeedsWorkspace(
-              reducing_threads, thread_step.scale, lower_args.target);
+              reducing_threads, thread_step.scale, ws_dtype,
+              lower_args.target);
           if (need_workspace) {
             int ws_size = block_threads * eff_batch;
             workspace = lower_args.add_workspace(ws_size, ws_dtype);
@@ -1234,6 +1235,7 @@ template <typename Impl> struct ReduceLowerer {
         Array<PrimExpr> thread_reduce_args = {
             StringImm(allreduce), BufferLoad(clear_buffer, red_indices)};
         if (Impl::AllReduceNeedsWorkspace(reducing_threads, thread_step.scale,
+                                          clear_buffer->dtype,
                                           lower_args.target)) {
           int workspace_size =
               static_cast<int>(*as_const_int(lower_args.thread_bounds->extent));
