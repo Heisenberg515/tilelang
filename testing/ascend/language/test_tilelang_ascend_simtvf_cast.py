@@ -1,8 +1,10 @@
 import pytest
+import re
 import torch
 import tilelang
 import tilelang.ascend.language as T
 import tilelang.testing
+from tilelang.engine.lower import lower
 
 
 THREADS = 128
@@ -97,6 +99,31 @@ def _broadcast_cast_arithmetic():
             T.copy(y_ub, y)
 
     return main
+
+
+def test_simtvf_e8m0_scalar_lowering():
+    """E8M0 is a raw exponent byte on Ascend (fp8_e8_t = uint8_t), so scalar
+    e8m0 values inside SimtVF must lower to the underlying byte type instead
+    of aborting the codegen (issue #4231)."""
+
+    @T.prim_func
+    def main(SF: T.Tensor((128,), "float8_e8m0fnu")):
+        with T.Kernel(1):
+            sf = T.alloc_shared((128,), "float8_e8m0fnu")
+            T.copy(SF, sf)
+            with T.SimtVF(threads=128):
+                tx = T.get_thread_binding(0)
+                T.print(sf[tx])  # scalar e8m0 load inside SimtVF
+                sf[tx] = sf[(tx + 1) % 128]  # scalar e8m0 store inside SimtVF
+
+    source = lower(main, target="ascend").kernel_source
+
+    # The buffer spelling is unchanged (the vector path already accepted it).
+    assert "fp8_e8_t" in source
+    # The scalar e8m0 local loads the raw byte into a uint8_t variable.
+    assert re.search(r"\buint8_t\b \w+ = sf\[", source)
+    # The scalar store writes back through the same byte-typed buffer.
+    assert re.search(r"sf\[[^\]]+\] = sf\[", source)
 
 
 def test_broadcast_cast_arbitrary_expression_uses_vector_cast():

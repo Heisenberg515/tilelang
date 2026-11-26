@@ -411,7 +411,15 @@ static std::string GetAscendFP8ScalarValueType(DataType type) {
   if (type.is_float8_e5m2()) {
     return "tl::float_e5m2_t";
   }
-  LOG(FATAL) << "Unsupported Ascend scalar fp8 conversion type " << type;
+  // E8M0 is a raw exponent byte on Ascend (fp8_e8_t = uint8_t in
+  // ascend_fp8.h), so its scalar spelling is the underlying byte type. E8M0
+  // is excluded from IsAscendVectorizableFP8, so no struct-only member calls
+  // (::from_bits, .data) are emitted for it.
+  if (type.is_float8_e8m0fnu()) {
+    return "uint8_t";
+  }
+  LOG(FATAL) << "Unsupported Ascend scalar fp8 conversion type " << type
+             << " (scalar fp8 types are only used inside SimtVF)";
   return "";
 }
 
