@@ -385,3 +385,38 @@ def test_equivalent_lexical_epoch_serializes_counter_ring():
         assert sorted(int(event.args[1]) for event in released) == sorted(int(event.args[1]) for event in acquired)
     root = next(block for block in nodes(after, tirx.SBlock) if block.name_hint == "tilelang_root")
     assert int(root.annotations["tl.buffer_versions_map"][ub.data]) == 2
+
+
+def _alias_pairs(mod):
+    pairs = set()
+    for block in nodes(mod, tirx.SBlock):
+        for storage, compatible in block.annotations.get("tl.buffer_alias_map", {}).items():
+            for other in compatible:
+                pairs.add(tuple(sorted((storage.name, other.name))))
+    return pairs
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_rank_reduced_l0_load_records_compact_access(partial):
+    # The compact-layout check in the memory detector must not underflow when
+    # a copy into L0 describes a rank-1 region: a partial rank-1 load keeps the
+    # L0A plane compact, so its storage must stay opaque to allocation reuse
+    # while a full rank-1 load remains reusable.
+    src = tirx.decl_buffer((4096,), "bfloat16", name="src", scope="shared.l1")
+    scratch = tirx.decl_buffer((4096,), "bfloat16", name="scratch", scope="shared.l1")
+    out = tirx.decl_buffer((4096,), "bfloat16", name="out")
+    a = tirx.decl_buffer((4096,), "bfloat16", name="a", scope="shared.l0a")
+    b = tirx.decl_buffer((4096,), "bfloat16", name="b", scope="shared.l0a")
+    extent = [2048] if partial else None
+    body = seq(
+        unit(copy(src, a, src_shape=extent, dst_shape=extent), core=2),
+        unit(copy(a, scratch, src_shape=extent, dst_shape=extent), core=2),
+        unit(copy(scratch, b), core=2),
+        unit(copy(b, out), core=2),
+    )
+    after = transform.InsertSync()(kernel(body, buffers=[src, scratch, a, b], params=[out]))
+    pairs = _alias_pairs(after)
+    if partial:
+        assert ("a", "b") not in pairs
+    else:
+        assert ("a", "b") in pairs

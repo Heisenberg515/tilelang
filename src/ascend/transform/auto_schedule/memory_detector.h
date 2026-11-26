@@ -1133,8 +1133,10 @@ private:
           bool l0 = IsL0ABuffer(region->buffer) ||
                     IsL0BBuffer(region->buffer) || IsL0CBuffer(region->buffer);
           bool compact = copy->l0_pitch.defined();
-          for (size_t i = region->region.size() - 2; i < region->region.size();
-               ++i)
+          // Rank-reduced views (e.g. a 1-D view of an L0 tile) would make
+          // `size() - 2` underflow and silently skip the extent check.
+          size_t rank = region->region.size();
+          for (size_t i = rank - std::min<size_t>(rank, 2); i < rank; ++i)
             compact |= !ana_.CanProveEqual(region->region[i]->extent,
                                            region->buffer->shape[i]);
           RecordL0MayAccess(region, is_read, l0 && compact);
