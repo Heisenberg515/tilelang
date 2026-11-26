@@ -365,8 +365,52 @@ private:
     return dst;
   }
 
+  Var EmitCast(const CastNode *cast, DataType dtype, Array<Stmt> *stmts) {
+    DataType src_dtype = cast->value.dtype();
+    if (cast->dtype != dtype) {
+      // A cast whose result type disagrees with the type the surrounding
+      // expression tree expects. Well-formed TIR from the frontend keeps
+      // binary operands and the stored value in one dtype, so reaching here
+      // means a mixed-dtype body this pass cannot lower faithfully.
+      TVM_FFI_THROW(ValueError)
+          << "AscendSimdVFLowerParallel: cast to " << cast->dtype
+          << " appears in an expression evaluated at dtype " << dtype
+          << "; mixed-dtype expressions are not lowerable in SimdVF vector "
+             "bodies. Rewrite the body so all operands share the stored dtype.";
+    }
+    if (src_dtype == dtype) {
+      // Identity cast (the frontend folds most, but not all of them).
+      return DecomposeExpr(cast->value, dtype, stmts);
+    }
+    if (cast->value.as<FloatImmNode>() || cast->value.as<IntImmNode>()) {
+      // Constant source: vdup's scalar argument converts implicitly.
+      return DecomposeExpr(cast->value, dtype, stmts);
+    }
+    // Real conversion: load/produce the source at its own dtype, then vcvt.
+    Var src = DecomposeExpr(cast->value, src_dtype, stmts);
+    Var dst = MakeReg(dtype);
+    stmts->push_back(tirx::Bind(
+        dst, Call(dst->dtype, simd_vcvt(),
+                  {src, mask_var_, StringImm("ROUND_R"), StringImm("RS_ENABLE"),
+                   StringImm("PART_EVEN"), StringImm("MODE_ZEROING")})));
+    return dst;
+  }
+
   Var DecomposeExpr(const PrimExpr &expr, DataType dtype, Array<Stmt> *stmts) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      if (dtype.bits() != load->buffer->dtype.bits()) {
+        // A single vld loads one VReg (256B) of the buffer's element type;
+        // producing a register of a different element width from it would
+        // load the wrong number of elements. Reject with a clear diagnostic
+        // instead of emitting a silently wrong load.
+        TVM_FFI_THROW(ValueError)
+            << "AscendSimdVFLowerParallel: buffer " << load->buffer->name
+            << " has element dtype " << load->buffer->dtype
+            << " but the expression is evaluated at dtype " << dtype
+            << "; loading a buffer whose element width differs from the "
+               "vector body dtype is not supported. Cast through a T.copy or "
+               "an explicit tl.simd.vcvt outside the T.Parallel body.";
+      }
       Var reg = MakeReg(dtype);
       bool depends_on_vreg = false;
       if (parallel_var_) {
@@ -405,6 +449,16 @@ private:
     if (const auto *n = expr.as<DivNode>()) {
       return EmitBinary(n->a, n->b, dtype, simd_vdiv(), stmts);
     }
+    if (const auto *n = expr.as<MaxNode>()) {
+      return EmitBinary(n->a, n->b, dtype, simd_vmax(), stmts);
+    }
+    if (const auto *n = expr.as<MinNode>()) {
+      return EmitBinary(n->a, n->b, dtype, simd_vmin(), stmts);
+    }
+
+    if (const auto *n = expr.as<CastNode>()) {
+      return EmitCast(n, dtype, stmts);
+    }
 
     if (const auto *call = expr.as<CallNode>()) {
       if (const auto *opn = call->op.as<OpNode>()) {
@@ -432,7 +486,13 @@ private:
       return reg;
     }
 
-    LOG(FATAL) << "AscendSimdVFLowerParallel: unsupported expr: " << expr;
+    TVM_FFI_THROW(ValueError)
+        << "AscendSimdVFLowerParallel: unsupported expr: " << expr
+        << ". Supported expressions in SimdVF vector bodies: buffer loads, "
+           "Add/Sub/Mul/Div, Max/Min, dtype casts, tir.exp/log/ln/sqrt/fabs, "
+           "and scalar constants. Select and comparisons are not lowerable "
+           "yet (the PTO path does not support them either); hoist them out "
+           "of the T.Parallel body or compute them on scalars.";
     return Var();
   }
 
