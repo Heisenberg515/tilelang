@@ -39,8 +39,10 @@ from .simt import (
     shuffle_vec,
     vector_from_list,
     vector_to_list,
+    vectorize_binary_f16,
     vectorize_binary_f32x2,
     vectorize_binary_fp8,
+    vectorize_unary_f16,
     vectorize_unary_f32x2,
 )
 from .sync import ascend_cross_core_set_flag, ascend_cross_core_wait_flag
@@ -80,7 +82,9 @@ __all__ = [
     "shuffle_vec",
     "vector_from_list",
     "vector_to_list",
+    "vectorize_binary_f16",
     "vectorize_binary_f32x2",
     "vectorize_binary_fp8",
+    "vectorize_unary_f16",
     "vectorize_unary_f32x2",
 ]

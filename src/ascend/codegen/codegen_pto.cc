@@ -440,16 +440,30 @@ bool IsStorageDtypeCompatible(DataType lhs, DataType rhs) {
   return lhs == rhs;
 }
 
+bool IsWideFloat16Vector(DataType t) {
+  return t.is_float16() && (t.lanes() == 4 || t.lanes() == 8);
+}
+
 bool IsSupportedFloatMinMaxType(DataType t) {
   if (t.is_scalar())
     return t.is_float16() || IsFloat32(t) || t.is_bfloat16();
+  // PTO's packed micro-ops stop at two lanes, but wider f16 vectors are
+  // split into supported x2 pairs (tl.vectorize_binary_f16), matching the
+  // AscendC backend's 2/4/8-lane support.
+  if (IsWideFloat16Vector(t))
+    return true;
   return t.lanes() == 2 &&
          (t.is_float16() || IsFloat32Pair(t) || t.is_bfloat16());
 }
 
 bool IsSupportedSIMTUnaryMathTypeImpl(DataType t) {
+  if (t.is_float16()) {
+    // Wider f16 vectors are split into supported x2 pairs
+    // (tl.vectorize_unary_f16).
+    return t.is_scalar() || t.lanes() == 2 || IsWideFloat16Vector(t);
+  }
   const bool scalar_or_pair = t.is_scalar() || t.lanes() == 2;
-  return scalar_or_pair && (t.is_float16() || (t.is_float() && t.bits() == 32));
+  return scalar_or_pair && (t.is_float() && t.bits() == 32);
 }
 
 bool IsSupportedSIMTUnaryMathType(DataType t) {
@@ -7449,13 +7463,25 @@ void CodeGenTileLangPTO::PrintFloatMinMax_(const char *op_name, DataType dtype,
                                            std::ostream &os) { // NOLINT(*)
   ICHECK(IsSupportedFloatMinMaxType(dtype))
       << "PTO floating min/max currently supports f16, f32, bf16, "
-         "vector<2xf16>, vector<2xf32>, and vector<2xbf16>, got "
+         "vector<2xf16>, vector<2xf32>, vector<2xbf16>, and f16 vectors of "
+         "4 or 8 lanes, got "
       << dtype;
 
   // PTO's packed min/max micro-ops omit f32x2. Apply the supported scalar f32
   // operation lane-by-lane and repack the pair instead.
   if (inside_simtvf_body_ && IsFloat32Pair(dtype)) {
     os << "tl.vectorize_binary_f32x2(pto." << op_name << ", ";
+    PrintExpr_(lhs, os);
+    os << ", ";
+    PrintExpr_(rhs, os);
+    os << ")";
+    return;
+  }
+
+  // Packed min/max micro-ops stop at two lanes, so wider f16 vectors are
+  // split into contiguous x2 pairs.
+  if (IsWideFloat16Vector(dtype)) {
+    os << "tl.vectorize_binary_f16(pto." << op_name << ", ";
     PrintExpr_(lhs, os);
     os << ", ";
     PrintExpr_(rhs, os);
@@ -7507,7 +7533,7 @@ bool CodeGenTileLangPTO::TryEmitUnaryMath_(const std::string &name,
   if (inside_simtvf_body_) {
     ICHECK(IsSupportedSIMTUnaryMathType(dtype))
         << "PTO SIMT " << name
-        << " currently supports f16, f32, vector<2xf16>, and vector<2xf32>, "
+        << " currently supports f16 (up to 8 lanes), f32, vector<2xf32>, "
            "got "
         << dtype;
   } else {
@@ -7527,6 +7553,19 @@ bool CodeGenTileLangPTO::TryEmitUnaryMath_(const std::string &name,
       ICHECK(!fn.empty() && fn.back() == '(');
       fn.pop_back();
       os << "tl.vectorize_unary_f32x2(" << fn << ", " << value << ")";
+    }
+    return true;
+  }
+  // Packed unary micro-ops stop at two lanes, so wider f16 vectors are
+  // split into contiguous x2 pairs.
+  if (inside_simtvf_body_ && IsWideFloat16Vector(dtype)) {
+    if (form.reciprocal) {
+      os << "tl.vectorize_unary_f16(tl.scalar_rsqrt, " << value << ")";
+    } else {
+      std::string fn = form.function;
+      ICHECK(!fn.empty() && fn.back() == '(');
+      fn.pop_back();
+      os << "tl.vectorize_unary_f16(" << fn << ", " << value << ")";
     }
     return true;
   }

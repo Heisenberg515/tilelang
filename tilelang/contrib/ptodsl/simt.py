@@ -73,6 +73,44 @@ def vectorize_binary_f32x2(op, lhs, rhs):
     )
 
 
+def vectorize_unary_f16(op, value):
+    """Apply a packed f16x2 unary op to an f16 vector of 2, 4, or 8 lanes.
+
+    PTO's packed unary micro-ops stop at two lanes, so wider f16 vectors are
+    split into contiguous two-lane pairs, processed with the packed op, and
+    recombined into the original width.
+    """
+    lanes = value.size
+    if lanes == 2:
+        return op(value)
+    if lanes not in {4, 8}:
+        raise ValueError(f"unsupported f16 vector width for unary math: {lanes}")
+    scalars = []
+    for offset in range(0, lanes, 2):
+        pair = shuffle_vec(pto.f16, (value,), (offset, offset + 1))
+        scalars.extend(vector_to_list(op(pair)))
+    return vector_from_list(pto.f16, scalars)
+
+
+def vectorize_binary_f16(op, lhs, rhs):
+    """Apply a packed f16x2 binary op to equal-width f16 vectors.
+
+    Mirrors vectorize_unary_f16 for two-operand packed micro-ops such as
+    minimum/maximum, which PTO also limits to two lanes.
+    """
+    lanes = lhs.size
+    if lanes == 2:
+        return op(lhs, rhs)
+    if lanes not in {4, 8} or rhs.size != lanes:
+        raise ValueError(f"unsupported f16 vector width for binary math: {lanes}")
+    scalars = []
+    for offset in range(0, lanes, 2):
+        a = shuffle_vec(pto.f16, (lhs,), (offset, offset + 1))
+        b = shuffle_vec(pto.f16, (rhs,), (offset, offset + 1))
+        scalars.extend(vector_to_list(op(a, b)))
+    return vector_from_list(pto.f16, scalars)
+
+
 def vectorize_binary_fp8(op, lhs, rhs, dtype):
     """Compute FP8 vectors through the supported packed two-lane conversions."""
     if op not in {"+", "-", "*"}:
