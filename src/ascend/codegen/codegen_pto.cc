@@ -3565,22 +3565,12 @@ std::string CodeGenTileLangPTO::GetLocalPtrExpr(const PrimExpr &expr,
   ICHECK(GetAddressOfIndex(expr, &index, &buffer_var))
       << "PTO local pointer expects address_of/tvm_access_ptr, got " << expr;
 
-  DataType elem_dtype = fallback_dtype;
-  if (const auto *call = expr.as<CallNode>()) {
-    if (call->op.same_as(builtin::tvm_access_ptr()) && !call->args.empty()) {
-      if (auto *type_call = call->args[0].as<CallNode>()) {
-        if (!type_call->args.empty()) {
-          if (const auto *dtype_name = type_call->args[0].as<StringImmNode>()) {
-            elem_dtype = ParseDataType(dtype_name->value);
-          }
-        }
-      }
-    } else if (call->op.same_as(builtin::address_of())) {
-      if (const auto *load = call->args[0].as<BufferLoadNode>()) {
-        elem_dtype = load->buffer->dtype;
-      }
-    }
-  }
+  // The frontends emit local pointers as tl::access_ptr(BufferLoad(...)),
+  // tvm_access_ptr(type, var, index, ...), or address_of(BufferLoad(...));
+  // GetAnnotatedPointerDtype recovers the element dtype from the underlying
+  // buffer in every form. The fallback only applies when the expression
+  // carries no recoverable dtype at all, never as a silent default.
+  DataType elem_dtype = GetAnnotatedPointerDtype(expr, fallback_dtype);
 
   std::string scope;
   if (alloc_storage_scope_.count(buffer_var)) {
@@ -4794,7 +4784,14 @@ void CodeGenTileLangPTO::EmitAscendCopyUbufToCbuf(const CallNode *op) {
       << "PTO UB->L1 copy currently only supports sub_blockid == 0, got "
       << op->args[2];
 
-  std::string dst = GetLocalPtrExpr(op->args[0], "mat", DataType::BFloat(16));
+  // Derive the element dtype from the L1 destination pointer instead of
+  // assuming a bfloat16 layout; the byte offset and the emitted pointer type
+  // both depend on it.
+  DataType dst_dtype = GetAnnotatedPointerDtype(op->args[0], DataType::Void());
+  ICHECK(!dst_dtype.is_void())
+      << "tl.ascend_copy_ubuf_to_cbuf expects an element dtype annotation on "
+      << "the L1 destination pointer, got " << op->args[0];
+  std::string dst = GetLocalPtrExpr(op->args[0], "mat", dst_dtype);
   std::string src = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
   std::string burst_num = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
   std::string burst_len = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
@@ -4811,8 +4808,19 @@ void CodeGenTileLangPTO::EmitAscendNd2NzPostCopy(const CallNode *op) {
   auto geometry = tl::ParseNd2NzGeometry(op, false);
   if (geometry.Empty())
     return;
-  std::string dst = GetLocalPtrExpr(op->args[0], "mat", DataType::BFloat(16));
-  std::string src = GetLocalPtrExpr(op->args[1], "ub", DataType::BFloat(16));
+  // Derive the element dtype from the pointers instead of assuming a
+  // bfloat16 layout; the byte offsets and the emitted pointer types both
+  // depend on it.
+  DataType dst_dtype = GetAnnotatedPointerDtype(op->args[0], DataType::Void());
+  ICHECK(!dst_dtype.is_void())
+      << "tl.ascend_nd2nz_post_copy expects an element dtype annotation on "
+      << "the L1 destination pointer, got " << op->args[0];
+  DataType src_dtype = GetAnnotatedPointerDtype(op->args[1], DataType::Void());
+  ICHECK(!src_dtype.is_void())
+      << "tl.ascend_nd2nz_post_copy expects an element dtype annotation on "
+      << "the UB source pointer, got " << op->args[1];
+  std::string dst = GetLocalPtrExpr(op->args[0], "mat", dst_dtype);
+  std::string src = GetLocalPtrExpr(op->args[1], "ub", src_dtype);
   int64_t burst_num = geometry.Bursts();
   int64_t burst_len = geometry.rows;
   int64_t src_gap = geometry.src_pitch - geometry.rows;
@@ -4835,10 +4843,19 @@ void CodeGenTileLangPTO::EmitAscendNd2NzScatter(const CallNode *op) {
   ICHECK(rows % 16 == 0) << "PTO nd2nz_scatter requires ROWS % 16 == 0, got "
                          << rows;
 
-  std::string src_ptr =
-      GetLocalPtrExpr(op->args[0], "ub", DataType::BFloat(16));
-  std::string dst_ptr =
-      GetLocalPtrExpr(op->args[1], "ub", DataType::BFloat(16));
+  // Derive the element dtype from the pointers instead of assuming a
+  // bfloat16 layout; the byte offsets and the emitted pointer types both
+  // depend on it.
+  DataType src_ptr_dtype = GetAnnotatedPointerDtype(op->args[0], DataType::Void());
+  ICHECK(!src_ptr_dtype.is_void())
+      << "tl.ascend_nd2nz_scatter expects an element dtype annotation on the "
+      << "UB source pointer, got " << op->args[0];
+  DataType dst_ptr_dtype = GetAnnotatedPointerDtype(op->args[1], DataType::Void());
+  ICHECK(!dst_ptr_dtype.is_void())
+      << "tl.ascend_nd2nz_scatter expects an element dtype annotation on the "
+      << "NZ UB destination pointer, got " << op->args[1];
+  std::string src_ptr = GetLocalPtrExpr(op->args[0], "ub", src_ptr_dtype);
+  std::string dst_ptr = GetLocalPtrExpr(op->args[1], "ub", dst_ptr_dtype);
 
   // Currently support same-type scatter only (the common case for dual_copy,
   // which rejects dtype mismatch on L0C->UB at the frontend level).
