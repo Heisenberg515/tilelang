@@ -4,6 +4,25 @@ from __future__ import annotations
 
 from tvm import tirx
 
+from .frame import inside_simdvf
+
+
+def _check_simdvf_placement(api: str, extra: str = "") -> None:
+    """Reject a pipeline sync primitive placed inside a T.SimdVF() block.
+
+    The underlying C primitives (asc_lock/asc_unlock/asc_sync*/asc_threadfence)
+    are plain __aicore__ functions, so a simd_vf function cannot call them; the
+    failure would otherwise only surface in bisheng as an unrelated
+    "no matching function for call to 'asc_lock'" error that never names the
+    Python API the user called.
+    """
+    if inside_simdvf():
+        raise ValueError(
+            f"T.{api} cannot be used inside T.SimdVF(): pipeline sync "
+            "primitives are not callable from a simd_vf function. Move the "
+            f"call outside the T.SimdVF() block{extra}"
+        )
+
 
 def ascend_pipe_barrier(pipe_t: str) -> None:
     """Insert an AscendC pipeline barrier.
@@ -16,10 +35,15 @@ def ascend_pipe_barrier(pipe_t: str) -> None:
         Pipeline type string, e.g., "PIPE_ALL", "PIPE_V", "PIPE_M",
         "PIPE_MTE1", "PIPE_MTE2", "PIPE_MTE3", "PIPE_S".
 
+        Must be called outside T.SimdVF() blocks: the underlying asc_sync
+        primitive is a plain __aicore__ function a simd_vf function cannot
+        call.
+
     Example
     -------
     >>> T.ascend_pipe_barrier("PIPE_ALL")
     """
+    _check_simdvf_placement("ascend_pipe_barrier")
     if not isinstance(pipe_t, str):
         raise TypeError(f"pipe_t must be a string, got {type(pipe_t)}")
     return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_pipe_barrier"), pipe_t)
@@ -37,10 +61,15 @@ def ascend_set_flag(hard_event: str, event_id) -> None:
     event_id : int or PrimExpr
         Event ID for synchronization.
 
+        Must be called outside T.SimdVF() blocks: the underlying asc_sync_notify
+        primitive is a plain __aicore__ function a simd_vf function cannot
+        call.
+
     Example
     -------
     >>> T.ascend_set_flag("S_MTE3", event_id)
     """
+    _check_simdvf_placement("ascend_set_flag")
     if not isinstance(hard_event, str):
         raise TypeError(f"hard_event must be a string, got {type(hard_event)}")
     if isinstance(event_id, int):
@@ -60,10 +89,15 @@ def ascend_wait_flag(hard_event: str, event_id) -> None:
     event_id : int or PrimExpr
         Event ID for synchronization.
 
+        Must be called outside T.SimdVF() blocks: the underlying asc_sync_wait
+        primitive is a plain __aicore__ function a simd_vf function cannot
+        call.
+
     Example
     -------
     >>> T.ascend_wait_flag("S_MTE3", event_id)
     """
+    _check_simdvf_placement("ascend_wait_flag")
     if not isinstance(hard_event, str):
         raise TypeError(f"hard_event must be a string, got {type(hard_event)}")
     if isinstance(event_id, int):
@@ -114,10 +148,15 @@ def ascend_threadfence() -> None:
 
     Generates: asc_threadfence();
 
+    The underlying primitive is __simt_callee__: it requires a SIMT caller,
+    so it is only usable inside a T.SimtVF() region and fails everywhere on
+    the AscendC SimdVF path. In particular it is rejected inside T.SimdVF().
+
     Example
     -------
     >>> T.ascend_threadfence()
     """
+    _check_simdvf_placement("ascend_threadfence")
     return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_threadfence"))
 
 
@@ -193,10 +232,17 @@ def ascend_get_buf(pipe, buf_id, mode=False):
     mode : bool
         Optional mode flag (default False).
 
+        Must be called outside T.SimdVF() blocks: the underlying asc_lock
+        primitive is a plain __aicore__ function a simd_vf function cannot
+        call. Use T.ascend_pipe_barrier outside the block instead.
+
     Example
     -------
     >>> T.ascend_get_buf("PIPE_MTE1", sk & 1)
     """
+    _check_simdvf_placement(
+        "ascend_get_buf", ", or use T.ascend_pipe_barrier outside the block instead"
+    )
     if isinstance(buf_id, int):
         buf_id = tirx.IntImm("int32", buf_id)
     mode_val = tirx.IntImm("int32", 1 if mode else 0)
@@ -217,10 +263,17 @@ def ascend_rls_buf(pipe, buf_id, mode=False):
     mode : bool
         Optional mode flag (default False).
 
+        Must be called outside T.SimdVF() blocks: the underlying asc_unlock
+        primitive is a plain __aicore__ function a simd_vf function cannot
+        call. Use T.ascend_pipe_barrier outside the block instead.
+
     Example
     -------
     >>> T.ascend_rls_buf("PIPE_M", sk & 1)
     """
+    _check_simdvf_placement(
+        "ascend_rls_buf", ", or use T.ascend_pipe_barrier outside the block instead"
+    )
     if isinstance(buf_id, int):
         buf_id = tirx.IntImm("int32", buf_id)
     mode_val = tirx.IntImm("int32", 1 if mode else 0)
