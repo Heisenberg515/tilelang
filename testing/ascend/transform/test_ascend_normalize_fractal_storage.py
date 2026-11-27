@@ -76,7 +76,7 @@ def test_accessed_cube_view_cannot_borrow_another_views_layout():
     alias = tirx.decl_buffer((3, 75), "bfloat16", name="alias", data=owner.data)
     pointer = T.access_ptr(alias[1, 0], "r", extent=1)
     before = _module(owner, owner, tirx.Evaluate(tirx.call_extern("int32", "consume", pointer)))
-    with pytest.raises(tvm.error.InternalError, match="Cube view alias needs its own layout"):
+    with pytest.raises(tvm.error.InternalError, match="Cube view alias is accessed without its own layout"):
         transform.NormalizeAscendFractalStorage()(before)
 
 
@@ -679,3 +679,66 @@ def test_sf_source_uses_scale_pair_transfer_geometry(dtype, source, expected):
     assert [int(x) for x in operation.args[0].args[2:]] == expected
     # The destination is a virtual handle describing the bound effective tile.
     assert [int(x) for x in operation.args[1].args[2:]] == source
+
+
+def test_match_buffer_alias_on_padded_cube_storage_is_rewritten():
+    owner = tirx.decl_buffer((15, 15), "bfloat16", name="owner", scope="shared.l1")
+    tile = tirx.decl_buffer((8, 15), "bfloat16", name="tile", scope="shared.l1")
+    match = tirx.MatchBufferRegion(
+        tile, tirx.BufferRegion(owner, [tvm.ir.Range(4, 12), tvm.ir.Range(0, 15)]))
+    body = tirx.BufferStore(tile, tirx.const(1, "bfloat16"), [1, 0])
+    block = tirx.SBlock([], [], [], "root", body, match_buffers=[match],
+                        alloc_buffers=[owner],
+                        annotations={"layout_map": {owner: make_ascend_nz_layout(owner)}})
+    before = tvm.IRModule(
+        {"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    after = transform.NormalizeAscendFractalStorage()(before)
+    root = after["main"].body.block
+    (store,) = nodes(after, tirx.BufferStore)
+    # The alias itself stays dense and untouched.
+    assert store.buffer.same_as(tile)
+    assert tuple(int(x) for x in store.indices) == (1, 0)
+    # Its match source now names the padded matrix storage with the same bounds.
+    source = root.match_buffers[0].source
+    assert source.buffer.same_as(root.alloc_buffers[0])
+    assert tuple(int(x) for x in source.buffer.shape) == (16, 16)
+    assert [(int(r.min), int(r.extent)) for r in source.region] == [(4, 8), (0, 15)]
+    tvm.ir.assert_structural_equal(
+        after, transform.NormalizeAscendFractalStorage()(after))
+
+
+def test_match_buffer_on_a_reshaped_cube_view_is_rejected():
+    owner = tirx.decl_buffer((15, 15), "bfloat16", name="owner", scope="shared.l1")
+    view = tirx.decl_buffer((225,), "bfloat16", name="view", data=owner.data)
+    tile = tirx.decl_buffer((30,), "bfloat16", name="tile", scope="shared.l1")
+    match = tirx.MatchBufferRegion(
+        tile, tirx.BufferRegion(view, [tvm.ir.Range(0, 30)]))
+    body = tirx.Evaluate(tile[5])
+    block = tirx.SBlock([], [], [], "root", body, match_buffers=[match],
+                        alloc_buffers=[owner],
+                        annotations={"layout_map": {
+                            owner: make_ascend_nz_layout(owner),
+                            view: make_ascend_nz_layout(owner).reshape((225,))}})
+    before = tvm.IRModule(
+        {"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    with pytest.raises(tvm.error.InternalError,
+                       match="loses its dense sub-region shape"):
+        transform.NormalizeAscendFractalStorage()(before)
+
+
+def test_match_buffer_target_with_fractal_layout_is_rejected():
+    owner = tirx.decl_buffer((15, 15), "bfloat16", name="owner", scope="shared.l1")
+    cube = tirx.decl_buffer((15, 15), "bfloat16", name="cube", scope="shared.l1")
+    match = tirx.MatchBufferRegion(
+        cube, tirx.BufferRegion(owner, [tvm.ir.Range(0, 15), tvm.ir.Range(0, 15)]))
+    body = tirx.Evaluate(cube[1, 0])
+    block = tirx.SBlock([], [], [], "root", body, match_buffers=[match],
+                        alloc_buffers=[owner],
+                        annotations={"layout_map": {
+                            owner: make_ascend_nz_layout(owner),
+                            cube: make_ascend_nz_layout(cube)}})
+    before = tvm.IRModule(
+        {"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    with pytest.raises(tvm.error.InternalError,
+                       match="has no dense alias bounds"):
+        transform.NormalizeAscendFractalStorage()(before)

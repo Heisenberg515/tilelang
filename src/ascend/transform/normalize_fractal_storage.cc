@@ -145,7 +145,9 @@ private:
       return buffer;
     ICHECK(layout.defined() || !accessed)
         << "Cube view " << buffer->name
-        << " needs its own layout; annotate this view explicitly";
+        << " is accessed without its own layout; annotate the view with "
+           "T.annotate_layout using the owning storage's fractal layout "
+           "reshaped to the view's shape";
     Optional<Buffer> matrix;
     for (const Buffer &view : views) {
       Layout candidate = layouts_[view]->Reshape(buffer->shape, analyzer_);
@@ -235,6 +237,28 @@ private:
           [&](PrimExpr index) { return analyzer_->Simplify(index); });
     return rewritten;
   }
+  // Mirror MatchBufferRegion's own construction rules: a region can only
+  // define a buffer whose shape the trailing extents spell out, with
+  // singleton axes allowed in front.
+  bool MatchBoundsCompatible_(const Buffer &buffer,
+                              const BufferRegion &source) {
+    if (source->region.size() < buffer->shape.size())
+      return false;
+    size_t offset = source->region.size() - buffer->shape.size();
+    for (size_t i = 0; i < source->region.size(); ++i) {
+      const PrimExpr &extent = source->region[i]->extent;
+      if (i < offset) {
+        if (!analyzer_->CanProveEqual(extent, Integer(1)))
+          return false;
+      } else if (!buffer->shape[i - offset]->IsInstance<VarNode>() &&
+                 !analyzer_->CanProveEqual(extent,
+                                           buffer->shape[i - offset])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   BufferRegion RewriteRegion_(const BufferRegion &region) {
     Buffer buffer = region->buffer;
     Array<Range> ranges = region->region.Map([&](const Range &range) {
@@ -549,11 +573,28 @@ private:
         op->reads.Map([&](const BufferRegion &r) { return RewriteRegion_(r); });
     prepared.CopyOnWrite()->writes = op->writes.Map(
         [&](const BufferRegion &r) { return RewriteRegion_(r); });
-    for (const auto &match : op->match_buffers)
-      ICHECK(!buffers_.count(match->buffer) &&
-             !buffers_.count(match->source->buffer))
-          << "Cube match_buffer regions are not supported; use a dense "
-             "reshape/view";
+    // A match_buffer binds dense sub-region bounds, so the base mutator's
+    // buffer-only swap is not enough: rewrite each source region here, while
+    // the logical bounds are still spelled in the alias's own coordinates.
+    if (!op->match_buffers.empty()) {
+      Array<MatchBufferRegion> match_buffers;
+      match_buffers.reserve(op->match_buffers.size());
+      for (const auto &match : op->match_buffers) {
+        ICHECK(!buffers_.count(match->buffer))
+            << "match_buffer cannot define the Cube buffer "
+            << match->buffer->name
+            << ": a padded fractal storage has no dense alias bounds. "
+               "Access the padded buffer directly instead";
+        BufferRegion source = RewriteRegion_(match->source);
+        ICHECK(MatchBoundsCompatible_(match->buffer, source))
+            << "Cube match_buffer source " << match->source->buffer->name
+            << " loses its dense sub-region shape after fractal padding. "
+               "Match the matrix buffer with a rectangular region instead";
+        match_buffers.push_back(
+            MatchBufferRegion(match->buffer, source));
+      }
+      prepared.CopyOnWrite()->match_buffers = std::move(match_buffers);
+    }
     SBlock block = Downcast<SBlock>(Parent::VisitStmt_(prepared.get()));
     if (auto value = op->annotations.Get(attr::kLayoutMap)) {
       Map<Buffer, Layout> layouts;
